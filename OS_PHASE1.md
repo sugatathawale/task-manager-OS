@@ -4,11 +4,11 @@ PROJECT PROPOSAL TEMPLATE
 Operating Systems Mini Project – Proposal
 
 Project Title: CPU Scheduling Simulator with Priority + Banker's Algorithm
-Student Name(s): ____________________________
-Roll No(s): _________________________________
-Branch / Section: ____________________________
-Academic Year: ______________________________
-Guide Name: _________________________________
+Student Name(s):Sugat & Siddhartha
+Roll No(s):230109 ,230104
+Branch / Section: B-Tech CS & Ai
+Academic Year: 230109
+Guide Name:Anuj kumar jha 
 
 1. Problem Statement
 We need a simple way to understand how an operating system schedules processes on the CPU. This project simulates scheduling algorithms and shows waiting time, turnaround time, and execution order.
@@ -34,8 +34,6 @@ Compiler: GCC / Turbo C
 
 6. Expected Outcome
 A console program that takes process input and prints a Gantt chart plus average waiting and turnaround times for each algorithm. Demonstrates OS scheduling clearly with one advanced method.
-
-Guide Approval Signature: ____________
 
 SOFTWARE REQUIREMENT SPECIFICATION (SRS)
 
