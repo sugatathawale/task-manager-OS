@@ -13,6 +13,7 @@ const STATE_LABELS = {
 
 const CPU_ALERT = 20
 const MEM_ALERT = 10
+const LOG_LIMIT = 5
 
 const formatKb = (kb) => {
   if (kb == null) return '—'
@@ -49,6 +50,7 @@ export default function App() {
   const [selected, setSelected] = useState(null)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(15)
+  const [actionLog, setActionLog] = useState([])
 
   const loadProcesses = async () => {
     setError('')
@@ -66,9 +68,33 @@ export default function App() {
     }
   }
 
-  const killProcess = async (pid, name) => {
+  const pushLog = (entry) => {
+    setActionLog((prev) => [entry, ...prev].slice(0, LOG_LIMIT))
+  }
+
+  const updateLog = (id, patch) => {
+    setActionLog((prev) => prev.map((item) => (item.id === id ? { ...item, ...patch } : item)))
+  }
+
+  const killProcess = async (pid, name, owner) => {
+    const isOwn = !currentUser || (owner || '').toLowerCase() === currentUser.toLowerCase()
+    if (!isOwn) {
+      setError('Permission denied. You can only terminate your own processes.')
+      return
+    }
+
     const ok = window.confirm(`Terminate ${name} (PID ${pid})?`)
     if (!ok) return
+
+    const logId = Date.now()
+    pushLog({
+      id: logId,
+      pid,
+      name,
+      status: 'pending',
+      message: 'Sending SIGTERM...',
+      time: new Date().toLocaleTimeString()
+    })
 
     try {
       const res = await fetch(`${API_BASE}/api/kill`, {
@@ -76,15 +102,18 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ pid })
       })
-      console.log("hi",res)
       const data = await res.json()
       const detail = data?.message
         ? `${data.error}: ${data.message} (errno ${data.errno})`
         : data?.error
       if (!res.ok) throw new Error(detail || 'Failed to terminate')
+
+      updateLog(logId, { status: 'success', message: 'Terminated successfully' })
       await loadProcesses()
     } catch (err) {
-      setError(err.message || 'Failed to terminate')
+      const msg = err.message || 'Failed to terminate'
+      updateLog(logId, { status: 'error', message: msg })
+      setError(msg)
     }
   }
 
@@ -337,6 +366,24 @@ export default function App() {
         </div>
       </section>
 
+      <section className="action-log">
+        <h3>Terminate Requests</h3>
+        {actionLog.length ? (
+          <ul>
+            {actionLog.map((item) => (
+              <li key={item.id} className={`log-item ${item.status}`}>
+                <span>
+                  {item.time} — PID {item.pid} ({item.name})
+                </span>
+                <span>{item.message}</span>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <p>No terminate requests yet.</p>
+        )}
+      </section>
+
       <section className="table">
         <div className="table-head">
           <span>PID</span>
@@ -351,6 +398,7 @@ export default function App() {
         <div className="table-body">
           {paged.map((p) => {
             const high = (p.cpu_percent || 0) >= CPU_ALERT || (p.mem_percent || 0) >= MEM_ALERT
+            const isOwn = !currentUser || (p.user || '').toLowerCase() === currentUser.toLowerCase()
             return (
               <div className={`row ${high ? 'alert' : ''}`} key={`${p.pid}-${p.name}`}>
                 <span className="pid" data-label="PID">{p.pid}</span>
@@ -364,7 +412,12 @@ export default function App() {
                   <button className="ghost" onClick={() => setSelected(p)}>
                     Details
                   </button>
-                  <button className="danger" onClick={() => killProcess(p.pid, p.name)}>
+                  <button
+                    className="danger"
+                    disabled={!isOwn}
+                    title={!isOwn ? 'Permission denied' : 'Terminate'}
+                    onClick={() => killProcess(p.pid, p.name, p.user)}
+                  >
                     Terminate
                   </button>
                 </span>
@@ -419,7 +472,18 @@ export default function App() {
               <button className="ghost" onClick={() => setSelected(null)}>
                 Close
               </button>
-              <button className="danger" onClick={() => killProcess(selected.pid, selected.name)}>
+              <button
+                className="danger"
+                disabled={
+                  currentUser && (selected.user || '').toLowerCase() !== currentUser.toLowerCase()
+                }
+                title={
+                  currentUser && (selected.user || '').toLowerCase() !== currentUser.toLowerCase()
+                    ? 'Permission denied'
+                    : 'Terminate'
+                }
+                onClick={() => killProcess(selected.pid, selected.name, selected.user)}
+              >
                 Terminate
               </button>
             </div>

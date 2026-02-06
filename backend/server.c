@@ -437,8 +437,11 @@ static void handle_request(int client, const char *method, const char *path, con
     int rc = kill(pid, SIGTERM);
     if (rc != 0) {
       char err[256];
+      const char *status = "500 Internal Server Error";
+      if (errno == EPERM) status = "403 Forbidden";
+      if (errno == ESRCH) status = "404 Not Found";
       snprintf(err, sizeof(err), "{\"error\":\"kill failed\",\"errno\":%d,\"message\":\"%s\"}", errno, strerror(errno));
-      send_response(client, "500 Internal Server Error", "application/json", err, strlen(err));
+      send_response(client, status, "application/json", err, strlen(err));
       return;
     }
 
