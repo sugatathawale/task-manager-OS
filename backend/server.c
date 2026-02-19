@@ -14,6 +14,9 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <unistd.h>
 
 #define PORT 8080
@@ -28,7 +31,13 @@ typedef struct {
   long vmrss_kb;
   double cpu_percent;
   double mem_percent;
+  int threads;
 } ProcessInfo;
+
+typedef struct {
+  int pid;
+  int count;
+} ThreadCount;
 
 typedef struct {
   char *data;
@@ -91,6 +100,77 @@ static bool is_pid_dir(const char *name) {
   return true;
 }
 
+static ThreadCount *collect_thread_counts(size_t *out_count) {
+  if (out_count) *out_count = 0;
+  FILE *fp = popen("ps -M -ax", "r");
+  if (!fp) return NULL;
+
+  size_t cap = 256;
+  size_t count = 0;
+  ThreadCount *list = (ThreadCount *)malloc(sizeof(ThreadCount) * cap);
+  if (!list) {
+    pclose(fp);
+    return NULL;
+  }
+
+  char line[512];
+  while (fgets(line, sizeof(line), fp)) {
+    if (strncmp(line, "USER", 4) == 0) continue;
+    int pid = 0;
+    char user[64] = {0};
+    char tt[32] = {0};
+    double cpu = 0.0;
+    char stat[16] = {0};
+    char pri[16] = {0};
+    char stime[32] = {0};
+    char utime[32] = {0};
+    char command[256] = {0};
+
+    int fields = sscanf(line, "%63s %d %31s %lf %15s %15s %31s %31s %255[^\n]",
+                        user, &pid, tt, &cpu, stat, pri, stime, utime, command);
+    if (fields < 2) {
+      fields = sscanf(line, "%d %31s %lf %15s %15s %31s %31s %255[^\n]",
+                      &pid, tt, &cpu, stat, pri, stime, utime, command);
+      if (fields < 1) continue;
+    }
+
+    if (pid <= 0) continue;
+
+    bool found = false;
+    for (size_t i = 0; i < count; ++i) {
+      if (list[i].pid == pid) {
+        list[i].count += 1;
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      if (count >= cap) {
+        cap *= 2;
+        ThreadCount *next = (ThreadCount *)realloc(list, sizeof(ThreadCount) * cap);
+        if (!next) break;
+        list = next;
+      }
+      list[count].pid = pid;
+      list[count].count = 1;
+      count++;
+    }
+  }
+
+  pclose(fp);
+  if (out_count) *out_count = count;
+  return list;
+}
+
+static int find_thread_count(ThreadCount *list, size_t count, int pid) {
+  if (!list || pid <= 0) return 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (list[i].pid == pid) return list[i].count;
+  }
+  return 0;
+}
+
 static void username_from_uid(uid_t uid, char *out, size_t out_len) {
   if (!out || out_len == 0) return;
   struct passwd *pw = getpwuid(uid);
@@ -113,6 +193,13 @@ static void current_user_name(char *out, size_t out_len) {
 }
 
 static long read_mem_total_kb(void) {
+#ifdef __APPLE__
+  int64_t memsize = 0;
+  size_t len = sizeof(memsize);
+  if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0 && memsize > 0) {
+    return (long)(memsize / 1024);
+  }
+#endif
   FILE *fp = fopen("/proc/meminfo", "r");
   if (!fp) return 0;
   char line[256];
@@ -136,7 +223,7 @@ static double read_uptime_seconds(void) {
   return up;
 }
 
-static void read_status_info(const char *pid, long *vmsize_kb, long *vmrss_kb, uid_t *uid_out) {
+static void read_status_info(const char *pid, long *vmsize_kb, long *vmrss_kb, uid_t *uid_out, int *threads_out) {
   char path[256];
   snprintf(path, sizeof(path), "/proc/%s/status", pid);
   FILE *fp = fopen(path, "r");
@@ -147,6 +234,10 @@ static void read_status_info(const char *pid, long *vmsize_kb, long *vmrss_kb, u
       sscanf(line + 7, "%ld", vmsize_kb);
     } else if (strncmp(line, "VmRSS:", 6) == 0) {
       sscanf(line + 6, "%ld", vmrss_kb);
+    } else if (strncmp(line, "Threads:", 8) == 0) {
+      int threads_val = 0;
+      sscanf(line + 8, "%d", &threads_val);
+      if (threads_out) *threads_out = threads_val;
     } else if (strncmp(line, "Uid:", 4) == 0) {
       unsigned long uid_val = 0;
       sscanf(line + 4, "%lu", &uid_val);
@@ -248,7 +339,7 @@ static ProcessInfo *collect_processes_proc(size_t *out_count) {
     if (!read_stat(ent->d_name, &info, &cpu_ticks, &start_ticks)) continue;
 
     uid_t uid_val = 0;
-    read_status_info(ent->d_name, &info.vmsize_kb, &info.vmrss_kb, &uid_val);
+    read_status_info(ent->d_name, &info.vmsize_kb, &info.vmrss_kb, &uid_val, &info.threads);
     username_from_uid(uid_val, info.user, sizeof(info.user));
 
     double seconds = uptime - ((double)start_ticks / (double)ticks_per_sec);
@@ -279,8 +370,11 @@ static ProcessInfo *collect_processes_ps(size_t *out_count) {
 
   size_t cap = 256;
   size_t count = 0;
+  size_t thread_count_len = 0;
+  ThreadCount *thread_counts = collect_thread_counts(&thread_count_len);
   ProcessInfo *list = (ProcessInfo *)malloc(sizeof(ProcessInfo) * cap);
   if (!list) {
+    if (thread_counts) free(thread_counts);
     pclose(fp);
     return NULL;
   }
@@ -316,11 +410,13 @@ static ProcessInfo *collect_processes_ps(size_t *out_count) {
     info.vmsize_kb = vsz;
     info.cpu_percent = pcpu;
     info.mem_percent = pmem;
+    info.threads = thread_counts ? find_thread_count(thread_counts, thread_count_len, pid) : 0;
 
     list[count++] = info;
   }
 
   pclose(fp);
+  if (thread_counts) free(thread_counts);
   *out_count = count;
   return list;
 }
@@ -344,6 +440,8 @@ static char *build_process_json(size_t *out_len) {
 
   qsort(list, count, sizeof(ProcessInfo), compare_pid);
 
+  long mem_total_kb = read_mem_total_kb();
+
   char current_user[64];
   current_user_name(current_user, sizeof(current_user));
 
@@ -351,7 +449,7 @@ static char *build_process_json(size_t *out_len) {
   sb_init(&sb, 8192);
   sb_appendf(&sb, "{\"current_user\":\"");
   sb_append_escaped(&sb, current_user);
-  sb_appendf(&sb, "\",\"count\":%zu,\"processes\":[", count);
+  sb_appendf(&sb, "\",\"count\":%zu,\"mem_total_kb\":%ld,\"processes\":[", count, mem_total_kb);
 
   for (size_t i = 0; i < count; ++i) {
     ProcessInfo *p = &list[i];
@@ -362,8 +460,8 @@ static char *build_process_json(size_t *out_len) {
     sb_append_escaped(&sb, p->user);
     sb_appendf(
         &sb,
-        "\",\"state\":\"%c\",\"vmsize_kb\":%ld,\"vmrss_kb\":%ld,\"cpu_percent\":%.2f,\"mem_percent\":%.2f}",
-        p->state, p->vmsize_kb, p->vmrss_kb, p->cpu_percent, p->mem_percent);
+        "\",\"state\":\"%c\",\"threads\":%d,\"vmsize_kb\":%ld,\"vmrss_kb\":%ld,\"cpu_percent\":%.2f,\"mem_percent\":%.2f}",
+        p->state, p->threads, p->vmsize_kb, p->vmrss_kb, p->cpu_percent, p->mem_percent);
   }
 
   sb_appendf(&sb, "]}");
