@@ -901,6 +901,18 @@ static int extract_int_field(const char *body, const char *key) {
   return atoi(p);
 }
 
+static int spawn_demo_task(void) {
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+
+  if (pid == 0) {
+    execlp("sleep", "sleep", "600", (char *)NULL);
+    _exit(127);
+  }
+
+  return (int)pid;
+}
+
 static void send_response(int client, const char *status, const char *content_type,
                           const char *body, size_t body_len) {
   char header[512];
@@ -939,6 +951,21 @@ static void handle_request(int client, const char *method, const char *path, con
     }
     send_response(client, "200 OK", "application/json", json, len);
     free(json);
+    return;
+  }
+
+  if (strcmp(method, "POST") == 0 && strcmp(path, "/api/spawn-demo-task") == 0) {
+    int pid = spawn_demo_task();
+    if (pid <= 0) {
+      char err[256];
+      snprintf(err, sizeof(err), "{\"error\":\"failed to start demo task\",\"errno\":%d,\"message\":\"%s\"}", errno, strerror(errno));
+      send_response(client, "500 Internal Server Error", "application/json", err, strlen(err));
+      return;
+    }
+
+    char ok[160];
+    snprintf(ok, sizeof(ok), "{\"status\":\"started\",\"pid\":%d,\"name\":\"sleep 600\"}", pid);
+    send_response(client, "200 OK", "application/json", ok, strlen(ok));
     return;
   }
 
@@ -987,6 +1014,8 @@ static void parse_request(const char *req, char *method, size_t mlen, char *path
 
 int main(void) {
   setlocale(LC_NUMERIC, "C");
+
+  signal(SIGCHLD, SIG_IGN);
 
   int server_fd = socket(AF_INET, SOCK_STREAM, 0);
   if (server_fd < 0) {
