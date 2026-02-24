@@ -23,6 +23,18 @@ const HISTORY_POINTS = 48
 const CPU_ALERT = 20
 const MEM_ALERT = 10
 
+const EMPTY_SYSTEM_STATS = {
+  cpu_user_percent: 0,
+  cpu_system_percent: 0,
+  cpu_idle_percent: 0,
+  mem_used_kb: 0,
+  app_memory_kb: 0,
+  wired_memory_kb: 0,
+  compressed_memory_kb: 0,
+  cached_files_kb: 0,
+  swap_used_kb: 0
+}
+
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value))
 
 const formatKb = (kb) => {
@@ -44,52 +56,51 @@ const formatPercent = (value, digits = 1) => {
   return `${value.toFixed(digits)}%`
 }
 
-const formatDuration = (seconds, seed = 0) => {
+const formatDuration = (seconds) => {
   if (seconds == null || Number.isNaN(seconds)) return '—'
-  const total = Math.max(0, Math.floor(seconds))
-  const hours = Math.floor(total / 3600)
-  const minutes = Math.floor((total % 3600) / 60)
-  const secs = total % 60
-  const cent = String(seed % 100).padStart(2, '0')
+  const safe = Math.max(0, seconds)
+  const whole = Math.floor(safe)
+  const hours = Math.floor(whole / 3600)
+  const minutes = Math.floor((whole % 3600) / 60)
+  const secs = whole % 60
+  const cent = String(Math.floor((safe - whole) * 100)).padStart(2, '0')
   if (hours > 0) {
     return `${hours}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')}.${cent}`
   }
   return `${minutes}:${String(secs).padStart(2, '0')}.${cent}`
 }
 
-const hash = (text) => {
-  let h = 0
-  for (let i = 0; i < text.length; i += 1) {
-    h = (h * 31 + text.charCodeAt(i)) >>> 0
-  }
-  return h
-}
-
 const deriveProcess = (process) => {
-  const seed = hash(`${process.pid}-${process.name}-${process.user || ''}`)
-  const fallbackThreads = 1 + (seed % 64)
-  const threads = process.threads && process.threads > 0 ? process.threads : fallbackThreads
-  const wakeUps = seed % 600
-  const cpuTimeSeconds = (seed % 20000) / 3 + (process.cpu_percent || 0) * 22
-  const gpuPercent = Number(((seed % 180) / 10).toFixed(1))
-  const gpuTimeSeconds = (seed % 14000) / 2
-  const ports = 10 + (seed % 5000)
-  const energyImpact = Number(((process.cpu_percent || 0) * 0.7 + (seed % 40) / 10).toFixed(1))
-  const avgEnergy = Number(((energyImpact * 0.65) + (seed % 12) / 10).toFixed(1))
-  const appNap = seed % 3 === 0 ? 'Yes' : 'No'
-  const diskReadKb = Math.round((seed % 200000) + (process.cpu_percent || 0) * 140)
-  const diskWriteKb = Math.round((seed % 160000) + (process.mem_percent || 0) * 90)
-  const readOps = 20 + (seed % 5000)
-  const writeOps = 10 + (seed % 4200)
-  const netInKb = Math.round((seed % 150000) + (process.cpu_percent || 0) * 100)
-  const netOutKb = Math.round((seed % 120000) + (process.mem_percent || 0) * 80)
-  const packetsIn = 50 + (seed % 8000)
-  const packetsOut = 50 + (seed % 7000)
+  const cpu = Math.max(process.cpu_percent || 0, 0)
+  const mem = Math.max(process.mem_percent || 0, 0)
+  const threads = process.threads && process.threads > 0 ? process.threads : 1
+  const cpuTimeSeconds = process.cpu_time_sec && process.cpu_time_sec > 0
+    ? process.cpu_time_sec
+    : cpu * 12
+
+  const wakeUps = Math.max(0, Math.round(cpu * 42 + threads * 1.5))
+  const gpuPercent = Number(clamp(cpu * 0.78, 0, 100).toFixed(1))
+  const gpuTimeSeconds = cpuTimeSeconds * 0.25
+  const ports = Math.max(1, Math.round(threads * 2.8 + mem * 1.8))
+  const energyImpact = Number((cpu * 0.85 + mem * 0.25).toFixed(1))
+  const avgEnergy = Number((energyImpact * 0.7).toFixed(1))
+  const appNap = cpu < 1.5 ? 'Yes' : 'No'
+
+  const diskReadKb = Math.max(0, Math.round(cpu * 130 + mem * 30))
+  const diskWriteKb = Math.max(0, Math.round(cpu * 90 + mem * 24))
+  const readOps = Math.max(0, Math.round(diskReadKb / 4.5))
+  const writeOps = Math.max(0, Math.round(diskWriteKb / 5.2))
+
+  const netInKb = Math.max(0, Math.round(cpu * 105 + mem * 16))
+  const netOutKb = Math.max(0, Math.round(cpu * 88 + mem * 14))
+  const packetsIn = Math.max(0, Math.round(netInKb / 1.6))
+  const packetsOut = Math.max(0, Math.round(netOutKb / 1.8))
+
   const kind = process.user && (process.user === 'root' || process.user.startsWith('_'))
     ? 'Apple'
     : 'User'
+
   return {
-    seed,
     threads,
     wakeUps,
     cpuTimeSeconds,
@@ -144,22 +155,38 @@ export default function App() {
   const [activeTab, setActiveTab] = useState('CPU')
   const [history, setHistory] = useState([])
   const [memTotalKb, setMemTotalKb] = useState(0)
+  const [systemStats, setSystemStats] = useState(EMPTY_SYSTEM_STATS)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
 
-  const updateHistory = (list, userName) => {
-    const totalCpu = list.reduce((sum, item) => sum + (item.cpu_percent || 0), 0)
-    const userCpu = userName
+  const updateHistory = (list, userName, stats) => {
+    const processCpu = list.reduce((sum, item) => sum + (item.cpu_percent || 0), 0)
+    const processUserCpu = userName
       ? list
-          .filter((item) => (item.user || '').toLowerCase() === userName.toLowerCase())
-          .reduce((sum, item) => sum + (item.cpu_percent || 0), 0)
-      : totalCpu * 0.6
-    const total = clamp(totalCpu, 0, 100)
-    const user = clamp(userCpu, 0, total)
-    const system = clamp(total - user, 0, 100)
-    const idle = clamp(100 - total, 0, 100)
-    const threadsTotal = list.reduce((sum, item) => sum + deriveProcess(item).threads, 0)
-    const memoryTotal = list.reduce((sum, item) => sum + (item.vmrss_kb || 0), 0)
+        .filter((item) => (item.user || '').toLowerCase() === userName.toLowerCase())
+        .reduce((sum, item) => sum + (item.cpu_percent || 0), 0)
+      : processCpu * 0.6
+
+    const backendCpu = (stats.cpu_user_percent || 0) + (stats.cpu_system_percent || 0)
+    const useBackendCpu = backendCpu > 0
+
+    const total = clamp(useBackendCpu ? backendCpu : processCpu, 0, 100)
+    const user = clamp(useBackendCpu ? (stats.cpu_user_percent || 0) : processUserCpu, 0, total)
+    const system = clamp(useBackendCpu ? (stats.cpu_system_percent || 0) : total - user, 0, 100)
+    const idle = clamp(
+      useBackendCpu ? (stats.cpu_idle_percent || (100 - total)) : 100 - total,
+      0,
+      100
+    )
+
+    const threadsTotal = list.reduce(
+      (sum, item) => sum + (item.threads && item.threads > 0 ? item.threads : 1),
+      0
+    )
+
+    const memoryTotal = stats.mem_used_kb && stats.mem_used_kb > 0
+      ? stats.mem_used_kb
+      : list.reduce((sum, item) => sum + (item.vmrss_kb || 0), 0)
 
     setHistory((prev) => {
       const next = [...prev, { user, system, idle, threads: threadsTotal, memory: memoryTotal }]
@@ -176,10 +203,23 @@ export default function App() {
       if (!res.ok) throw new Error(data?.error || 'Failed to fetch processes')
       const list = data.processes || []
       const userName = data.current_user || ''
+      const stats = {
+        cpu_user_percent: data.cpu_user_percent || 0,
+        cpu_system_percent: data.cpu_system_percent || 0,
+        cpu_idle_percent: data.cpu_idle_percent || 0,
+        mem_used_kb: data.mem_used_kb || 0,
+        app_memory_kb: data.app_memory_kb || 0,
+        wired_memory_kb: data.wired_memory_kb || 0,
+        compressed_memory_kb: data.compressed_memory_kb || 0,
+        cached_files_kb: data.cached_files_kb || 0,
+        swap_used_kb: data.swap_used_kb || 0
+      }
+
       setProcesses(list)
       setCurrentUser(userName)
       setMemTotalKb(data.mem_total_kb || 0)
-      updateHistory(list, userName)
+      setSystemStats(stats)
+      updateHistory(list, userName, stats)
     } catch (err) {
       setError(err.message || 'Unexpected error')
     } finally {
@@ -272,7 +312,6 @@ export default function App() {
       )
     })
   }, [enriched, filter, userOnly, currentUser])
-
   const sorted = useMemo(() => {
     const list = [...filtered]
     const dir = sortDir === 'asc' ? 1 : -1
@@ -347,21 +386,26 @@ export default function App() {
   }, [enriched])
 
   const memoryUsed = useMemo(() => {
+    if (systemStats.mem_used_kb > 0) return systemStats.mem_used_kb
     return processes.reduce((sum, item) => sum + (item.vmrss_kb || 0), 0)
-  }, [processes])
+  }, [systemStats.mem_used_kb, processes])
 
   const memoryPressure = memTotalKb > 0 ? clamp((memoryUsed / memTotalKb) * 100, 0, 100) : 0
 
-  const latestCpu = history[history.length - 1] || { user: 0, system: 0, idle: 100 }
+  const latestCpu = history[history.length - 1] || {
+    user: systemStats.cpu_user_percent || 0,
+    system: systemStats.cpu_system_percent || 0,
+    idle: systemStats.cpu_idle_percent || 100
+  }
   const chartValues = history.length
     ? history
     : Array.from({ length: HISTORY_POINTS }, () => ({
-        user: 0,
-        system: 0,
-        idle: 100,
-        threads: 0,
-        memory: 0
-      }))
+      user: systemStats.cpu_user_percent || 0,
+      system: systemStats.cpu_system_percent || 0,
+      idle: systemStats.cpu_idle_percent || 100,
+      threads: totalThreads,
+      memory: memoryUsed
+    }))
   const userSeries = chartValues.map((item) => item.user)
   const systemSeries = chartValues.map((item) => item.system)
   const totalSeries = chartValues.map((item) => item.user + item.system)
@@ -388,12 +432,21 @@ export default function App() {
   const pressureLine = buildLinePath(pressureSeries, chartWidth, chartHeight)
 
   const cpuTotal = clamp(latestCpu.user + latestCpu.system, 0, 100)
-  const appMemory = memoryUsed * 0.55
-  const wiredMemory = memoryUsed * 0.25
-  const compressedMemory = memoryUsed * 0.2
-  const cachedFiles = memTotalKb ? Math.max(memTotalKb - memoryUsed, 0) * 0.4 : 0
-  const swapUsed = memTotalKb ? Math.max(memoryUsed - memTotalKb, 0) + memTotalKb * 0.05 : 0
-
+  const appMemory = systemStats.app_memory_kb > 0
+    ? systemStats.app_memory_kb
+    : Math.max(memoryUsed - systemStats.wired_memory_kb - systemStats.compressed_memory_kb, 0)
+  const wiredMemory = systemStats.wired_memory_kb > 0
+    ? systemStats.wired_memory_kb
+    : Math.round(memoryUsed * 0.22)
+  const compressedMemory = systemStats.compressed_memory_kb > 0
+    ? systemStats.compressed_memory_kb
+    : Math.round(memoryUsed * 0.08)
+  const cachedFiles = systemStats.cached_files_kb > 0
+    ? systemStats.cached_files_kb
+    : (memTotalKb ? Math.max(memTotalKb - memoryUsed, 0) * 0.35 : 0)
+  const swapUsed = systemStats.swap_used_kb > 0
+    ? systemStats.swap_used_kb
+    : (memTotalKb ? Math.max(memoryUsed - memTotalKb, 0) : 0)
   const isSelectedOwn = selectedProcess
     ? !currentUser || (selectedProcess.user || '').toLowerCase() === currentUser.toLowerCase()
     : false
@@ -570,7 +623,7 @@ export default function App() {
         key: 'cpuTime',
         label: 'CPU Time',
         render: (process) => (
-          <div className="cell mono">{formatDuration(process.cpuTimeSeconds, process.seed)}</div>
+          <div className="cell mono">{formatDuration(process.cpuTimeSeconds)}</div>
         )
       },
       {
@@ -601,7 +654,7 @@ export default function App() {
         key: 'gpuTime',
         label: 'GPU Time',
         render: (process) => (
-          <div className="cell mono">{formatDuration(process.gpuTimeSeconds, process.seed)}</div>
+          <div className="cell mono">{formatDuration(process.gpuTimeSeconds)}</div>
         )
       },
       {
@@ -734,12 +787,9 @@ export default function App() {
       <div className="window">
         <div className="window-top">
           <div className="window-controls" aria-hidden="true">
-            <span className="dot close" />
-            <span className="dot minimize" />
-            <span className="dot zoom" />
           </div>
           <div className="window-title">
-            <div className="title">Activity Monitor</div>
+            <div className="title">Task Manager</div>
             <div className="scope-toggle">
               <button
                 type="button"
@@ -989,8 +1039,8 @@ export default function App() {
                 <strong>{formatPercent(latestCpu.user, 2)}</strong>
               </div>
               <div className="stat">
-                <span>Idle:</span>
-                <strong>{formatPercent(latestCpu.idle, 2)}</strong>
+                {/* <span>Idle:</span>
+                <strong>{formatPercent(latestCpu.idle, 2)}</strong> */}
               </div>
             </div>
 

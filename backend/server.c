@@ -8,9 +8,11 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -31,6 +33,7 @@ typedef struct {
   long vmrss_kb;
   double cpu_percent;
   double mem_percent;
+  double cpu_time_sec;
   int threads;
 } ProcessInfo;
 
@@ -40,10 +43,39 @@ typedef struct {
 } ThreadCount;
 
 typedef struct {
+  double cpu_user_percent;
+  double cpu_system_percent;
+  double cpu_idle_percent;
+  long mem_total_kb;
+  long mem_used_kb;
+  long app_memory_kb;
+  long wired_memory_kb;
+  long compressed_memory_kb;
+  long cached_files_kb;
+  long swap_used_kb;
+} SystemStats;
+
+typedef struct {
   char *data;
   size_t len;
   size_t cap;
 } StrBuf;
+
+#ifndef __APPLE__
+typedef struct {
+  unsigned long long user;
+  unsigned long long nice;
+  unsigned long long system;
+  unsigned long long idle;
+  unsigned long long iowait;
+  unsigned long long irq;
+  unsigned long long softirq;
+  unsigned long long steal;
+  bool valid;
+} CpuSnapshot;
+
+static CpuSnapshot g_prev_cpu = {0};
+#endif
 
 static void sb_init(StrBuf *sb, size_t cap) {
   sb->data = (char *)malloc(cap);
@@ -100,75 +132,123 @@ static bool is_pid_dir(const char *name) {
   return true;
 }
 
-static ThreadCount *collect_thread_counts(size_t *out_count) {
-  if (out_count) *out_count = 0;
-  FILE *fp = popen("ps -M -ax", "r");
-  if (!fp) return NULL;
+static long parse_size_kb(const char *raw) {
+  if (!raw || !*raw) return 0;
 
-  size_t cap = 256;
-  size_t count = 0;
-  ThreadCount *list = (ThreadCount *)malloc(sizeof(ThreadCount) * cap);
-  if (!list) {
-    pclose(fp);
-    return NULL;
-  }
-
-  char line[512];
-  while (fgets(line, sizeof(line), fp)) {
-    if (strncmp(line, "USER", 4) == 0) continue;
-    int pid = 0;
-    char user[64] = {0};
-    char tt[32] = {0};
-    double cpu = 0.0;
-    char stat[16] = {0};
-    char pri[16] = {0};
-    char stime[32] = {0};
-    char utime[32] = {0};
-    char command[256] = {0};
-
-    int fields = sscanf(line, "%63s %d %31s %lf %15s %15s %31s %31s %255[^\n]",
-                        user, &pid, tt, &cpu, stat, pri, stime, utime, command);
-    if (fields < 2) {
-      fields = sscanf(line, "%d %31s %lf %15s %15s %31s %31s %255[^\n]",
-                      &pid, tt, &cpu, stat, pri, stime, utime, command);
-      if (fields < 1) continue;
-    }
-
-    if (pid <= 0) continue;
-
-    bool found = false;
-    for (size_t i = 0; i < count; ++i) {
-      if (list[i].pid == pid) {
-        list[i].count += 1;
-        found = true;
-        break;
-      }
-    }
-
-    if (!found) {
-      if (count >= cap) {
-        cap *= 2;
-        ThreadCount *next = (ThreadCount *)realloc(list, sizeof(ThreadCount) * cap);
-        if (!next) break;
-        list = next;
-      }
-      list[count].pid = pid;
-      list[count].count = 1;
-      count++;
+  char tmp[64];
+  size_t j = 0;
+  for (size_t i = 0; raw[i] && j < sizeof(tmp) - 1; ++i) {
+    char c = raw[i];
+    if (isdigit((unsigned char)c) || c == '.' || c == 'K' || c == 'k' || c == 'M' || c == 'm' ||
+        c == 'G' || c == 'g' || c == 'T' || c == 't' || c == 'B' || c == 'b') {
+      tmp[j++] = c;
     }
   }
+  tmp[j] = '\0';
+  if (tmp[0] == '\0') return 0;
 
-  pclose(fp);
-  if (out_count) *out_count = count;
-  return list;
+  char *end = NULL;
+  double value = strtod(tmp, &end);
+  if (!end || end == tmp) return 0;
+
+  char unit = '\0';
+  while (*end) {
+    if (isalpha((unsigned char)*end)) {
+      unit = (char)tolower((unsigned char)*end);
+      break;
+    }
+    end++;
+  }
+
+  double factor = 1.0;
+  if (unit == 'b') factor = 1.0 / 1024.0;
+  if (unit == 'k') factor = 1.0;
+  if (unit == 'm') factor = 1024.0;
+  if (unit == 'g') factor = 1024.0 * 1024.0;
+  if (unit == 't') factor = 1024.0 * 1024.0 * 1024.0;
+
+  if (value < 0) value = 0;
+  return (long)(value * factor);
 }
 
-static int find_thread_count(ThreadCount *list, size_t count, int pid) {
-  if (!list || pid <= 0) return 0;
-  for (size_t i = 0; i < count; ++i) {
-    if (list[i].pid == pid) return list[i].count;
+static double parse_cpu_time_seconds(const char *raw) {
+  if (!raw || !*raw) return 0.0;
+
+  int colons = 0;
+  for (const char *p = raw; *p; ++p) {
+    if (*p == ':') colons++;
   }
-  return 0;
+
+  int days = 0;
+  int hours = 0;
+  int minutes = 0;
+  double seconds = 0.0;
+
+  if (strchr(raw, '-')) {
+    if (sscanf(raw, "%d-%d:%d:%lf", &days, &hours, &minutes, &seconds) == 4) {
+      return (double)days * 86400.0 + (double)hours * 3600.0 + (double)minutes * 60.0 + seconds;
+    }
+  }
+
+  if (colons == 2) {
+    if (sscanf(raw, "%d:%d:%lf", &hours, &minutes, &seconds) == 3) {
+      return (double)hours * 3600.0 + (double)minutes * 60.0 + seconds;
+    }
+  }
+
+  if (colons == 1) {
+    if (sscanf(raw, "%d:%lf", &minutes, &seconds) == 2) {
+      return (double)minutes * 60.0 + seconds;
+    }
+  }
+
+  return atof(raw);
+}
+
+static bool extract_size_before_word(const char *line, const char *word, long *out_kb) {
+  if (!line || !word || !out_kb) return false;
+
+  char copy[512];
+  snprintf(copy, sizeof(copy), "%s", line);
+
+  char prev[64] = {0};
+  char *tok = strtok(copy, " \t\r\n");
+  while (tok) {
+    char cleaned[64] = {0};
+    size_t j = 0;
+    for (size_t i = 0; tok[i] && j < sizeof(cleaned) - 1; ++i) {
+      if (isalnum((unsigned char)tok[i]) || tok[i] == '.') {
+        cleaned[j++] = tok[i];
+      }
+    }
+    cleaned[j] = '\0';
+
+    if (cleaned[0]) {
+      if (strcasecmp(cleaned, word) == 0 && prev[0]) {
+        *out_kb = parse_size_kb(prev);
+        return *out_kb > 0;
+      }
+      snprintf(prev, sizeof(prev), "%s", cleaned);
+    }
+
+    tok = strtok(NULL, " \t\r\n");
+  }
+
+  return false;
+}
+
+static unsigned long long parse_u64_digits(const char *raw) {
+  if (!raw) return 0;
+  char digits[64];
+  size_t j = 0;
+  for (size_t i = 0; raw[i] && j < sizeof(digits) - 1; ++i) {
+    if (isdigit((unsigned char)raw[i])) {
+      digits[j++] = raw[i];
+    }
+  }
+  digits[j] = '\0';
+  if (!digits[0]) return 0;
+  return strtoull(digits, NULL, 10);
 }
 
 static void username_from_uid(uid_t uid, char *out, size_t out_len) {
@@ -200,6 +280,7 @@ static long read_mem_total_kb(void) {
     return (long)(memsize / 1024);
   }
 #endif
+
   FILE *fp = fopen("/proc/meminfo", "r");
   if (!fp) return 0;
   char line[256];
@@ -223,7 +304,8 @@ static double read_uptime_seconds(void) {
   return up;
 }
 
-static void read_status_info(const char *pid, long *vmsize_kb, long *vmrss_kb, uid_t *uid_out, int *threads_out) {
+static void read_status_info(const char *pid, long *vmsize_kb, long *vmrss_kb, uid_t *uid_out,
+                             int *threads_out) {
   char path[256];
   snprintf(path, sizeof(path), "/proc/%s/status", pid);
   FILE *fp = fopen(path, "r");
@@ -247,7 +329,8 @@ static void read_status_info(const char *pid, long *vmsize_kb, long *vmrss_kb, u
   fclose(fp);
 }
 
-static bool read_stat(const char *pid, ProcessInfo *info, unsigned long *cpu_ticks, unsigned long *start_ticks) {
+static bool read_stat(const char *pid, ProcessInfo *info, unsigned long *cpu_ticks,
+                      unsigned long *start_ticks) {
   char path[256];
   snprintf(path, sizeof(path), "/proc/%s/stat", pid);
   FILE *fp = fopen(path, "r");
@@ -298,6 +381,78 @@ static bool read_stat(const char *pid, ProcessInfo *info, unsigned long *cpu_tic
   return true;
 }
 
+static ThreadCount *collect_thread_counts(size_t *out_count) {
+  if (out_count) *out_count = 0;
+  FILE *fp = popen("ps -M -ax", "r");
+  if (!fp) return NULL;
+
+  size_t cap = 256;
+  size_t count = 0;
+  ThreadCount *list = (ThreadCount *)malloc(sizeof(ThreadCount) * cap);
+  if (!list) {
+    pclose(fp);
+    return NULL;
+  }
+
+  char line[512];
+  while (fgets(line, sizeof(line), fp)) {
+    if (strncmp(line, "USER", 4) == 0) continue;
+
+    int pid = 0;
+    char user[64] = {0};
+    char tt[32] = {0};
+    double cpu = 0.0;
+    char stat[16] = {0};
+    char pri[16] = {0};
+    char stime[32] = {0};
+    char utime[32] = {0};
+    char command[256] = {0};
+
+    int fields = sscanf(line, "%63s %d %31s %lf %15s %15s %31s %31s %255[^\n]", user, &pid, tt,
+                        &cpu, stat, pri, stime, utime, command);
+    if (fields < 2) {
+      fields = sscanf(line, "%d %31s %lf %15s %15s %31s %31s %255[^\n]", &pid, tt, &cpu, stat,
+                      pri, stime, utime, command);
+      if (fields < 1) continue;
+    }
+
+    if (pid <= 0) continue;
+
+    bool found = false;
+    for (size_t i = 0; i < count; ++i) {
+      if (list[i].pid == pid) {
+        list[i].count += 1;
+        found = true;
+        break;
+      }
+    }
+
+    if (!found) {
+      if (count >= cap) {
+        cap *= 2;
+        ThreadCount *next = (ThreadCount *)realloc(list, sizeof(ThreadCount) * cap);
+        if (!next) break;
+        list = next;
+      }
+      list[count].pid = pid;
+      list[count].count = 1;
+      count++;
+    }
+  }
+
+  pclose(fp);
+  if (out_count) *out_count = count;
+  return list;
+}
+
+static int find_thread_count(ThreadCount *list, size_t count, int pid) {
+  if (!list || pid <= 0) return 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (list[i].pid == pid) return list[i].count;
+  }
+  return 0;
+}
+
 static ProcessInfo *collect_processes_proc(size_t *out_count) {
   DIR *dir = opendir("/proc");
   if (!dir) return NULL;
@@ -330,9 +485,6 @@ static ProcessInfo *collect_processes_proc(size_t *out_count) {
     ProcessInfo info;
     memset(&info, 0, sizeof(info));
     info.pid = atoi(ent->d_name);
-    info.vmsize_kb = 0;
-    info.vmrss_kb = 0;
-    info.user[0] = '\0';
 
     unsigned long cpu_ticks = 0;
     unsigned long start_ticks = 0;
@@ -343,8 +495,10 @@ static ProcessInfo *collect_processes_proc(size_t *out_count) {
     username_from_uid(uid_val, info.user, sizeof(info.user));
 
     double seconds = uptime - ((double)start_ticks / (double)ticks_per_sec);
+    double total_time = (double)cpu_ticks / (double)ticks_per_sec;
+    info.cpu_time_sec = total_time;
+
     if (seconds > 0) {
-      double total_time = (double)cpu_ticks / (double)ticks_per_sec;
       info.cpu_percent = (total_time / seconds) * 100.0 / (double)cpu_count;
     } else {
       info.cpu_percent = 0.0;
@@ -365,7 +519,7 @@ static ProcessInfo *collect_processes_proc(size_t *out_count) {
 }
 
 static ProcessInfo *collect_processes_ps(size_t *out_count) {
-  FILE *fp = popen("ps -axo user=,pid=,comm=,state=,rss=,vsz=,pcpu=,pmem=", "r");
+  FILE *fp = popen("ps -axo user=,pid=,comm=,state=,rss=,vsz=,pcpu=,pmem=,time=", "r");
   if (!fp) return NULL;
 
   size_t cap = 256;
@@ -379,7 +533,7 @@ static ProcessInfo *collect_processes_ps(size_t *out_count) {
     return NULL;
   }
 
-  char line[512];
+  char line[640];
   while (fgets(line, sizeof(line), fp)) {
     int pid = 0;
     char user[64] = {0};
@@ -389,9 +543,11 @@ static ProcessInfo *collect_processes_ps(size_t *out_count) {
     long vsz = 0;
     double pcpu = 0.0;
     double pmem = 0.0;
+    char cputime[64] = {0};
 
-    int fields = sscanf(line, "%63s %d %255s %31s %ld %ld %lf %lf", user, &pid, comm, state, &rss, &vsz, &pcpu, &pmem);
-    if (fields < 4 || pid <= 0) continue;
+    int fields = sscanf(line, "%63s %d %255s %31s %ld %ld %lf %lf %63s", user, &pid, comm, state,
+                        &rss, &vsz, &pcpu, &pmem, cputime);
+    if (fields < 8 || pid <= 0) continue;
 
     if (count >= cap) {
       cap *= 2;
@@ -410,6 +566,7 @@ static ProcessInfo *collect_processes_ps(size_t *out_count) {
     info.vmsize_kb = vsz;
     info.cpu_percent = pcpu;
     info.mem_percent = pmem;
+    info.cpu_time_sec = parse_cpu_time_seconds(cputime);
     info.threads = thread_counts ? find_thread_count(thread_counts, thread_count_len, pid) : 0;
 
     list[count++] = info;
@@ -433,6 +590,260 @@ static int compare_pid(const void *a, const void *b) {
   return (pa->pid - pb->pid);
 }
 
+static void init_system_stats(SystemStats *stats) {
+  memset(stats, 0, sizeof(*stats));
+  stats->mem_total_kb = read_mem_total_kb();
+}
+
+#ifdef __APPLE__
+static void read_system_stats_apple(SystemStats *stats) {
+  FILE *fp = popen("top -l 1 -n 0", "r");
+  if (fp) {
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+      if (strstr(line, "CPU usage:")) {
+        double user = 0.0;
+        double sys = 0.0;
+        double idle = 0.0;
+        if (sscanf(line, "CPU usage: %lf%% user, %lf%% sys, %lf%% idle", &user, &sys, &idle) == 3) {
+          stats->cpu_user_percent = user;
+          stats->cpu_system_percent = sys;
+          stats->cpu_idle_percent = idle;
+        }
+      }
+
+      if (strstr(line, "PhysMem:")) {
+        long used = 0;
+        long wired = 0;
+        long compressed = 0;
+        long unused = 0;
+
+        extract_size_before_word(line, "used", &used);
+        extract_size_before_word(line, "wired", &wired);
+        extract_size_before_word(line, "compressor", &compressed);
+        extract_size_before_word(line, "unused", &unused);
+
+        if (used > 0) stats->mem_used_kb = used;
+        if (wired > 0) stats->wired_memory_kb = wired;
+        if (compressed > 0) stats->compressed_memory_kb = compressed;
+
+        if (stats->mem_total_kb <= 0 && used > 0 && unused > 0) {
+          stats->mem_total_kb = used + unused;
+        }
+      }
+    }
+    pclose(fp);
+  }
+
+  long page_size = 4096;
+  unsigned long long file_backed_pages = 0;
+  unsigned long long active_pages = 0;
+  unsigned long long inactive_pages = 0;
+  unsigned long long speculative_pages = 0;
+  unsigned long long free_pages = 0;
+  unsigned long long wired_pages = 0;
+  unsigned long long compressed_pages = 0;
+
+  fp = popen("vm_stat", "r");
+  if (fp) {
+    char line[512];
+    while (fgets(line, sizeof(line), fp)) {
+      char *page_size_ptr = strstr(line, "page size of ");
+      if (page_size_ptr) {
+        long bytes = 0;
+        if (sscanf(page_size_ptr, "page size of %ld bytes", &bytes) == 1 && bytes > 0) {
+          page_size = bytes;
+        }
+      }
+
+      if (strncmp(line, "File-backed pages:", 18) == 0) {
+        file_backed_pages = parse_u64_digits(line);
+      } else if (strncmp(line, "Pages active:", 13) == 0) {
+        active_pages = parse_u64_digits(line);
+      } else if (strncmp(line, "Pages inactive:", 15) == 0) {
+        inactive_pages = parse_u64_digits(line);
+      } else if (strncmp(line, "Pages speculative:", 18) == 0) {
+        speculative_pages = parse_u64_digits(line);
+      } else if (strncmp(line, "Pages free:", 11) == 0) {
+        free_pages = parse_u64_digits(line);
+      } else if (strncmp(line, "Pages wired down:", 17) == 0) {
+        wired_pages = parse_u64_digits(line);
+      } else if (strncmp(line, "Pages occupied by compressor:", 29) == 0) {
+        compressed_pages = parse_u64_digits(line);
+      }
+    }
+    pclose(fp);
+  }
+
+  if (file_backed_pages > 0) {
+    stats->cached_files_kb = (long)((file_backed_pages * (unsigned long long)page_size) / 1024ULL);
+  }
+
+  if (stats->wired_memory_kb <= 0 && wired_pages > 0) {
+    stats->wired_memory_kb = (long)((wired_pages * (unsigned long long)page_size) / 1024ULL);
+  }
+
+  if (stats->compressed_memory_kb <= 0 && compressed_pages > 0) {
+    stats->compressed_memory_kb =
+        (long)((compressed_pages * (unsigned long long)page_size) / 1024ULL);
+  }
+
+  if (stats->mem_used_kb <= 0 && stats->mem_total_kb > 0) {
+    unsigned long long used_pages = active_pages + inactive_pages + speculative_pages + wired_pages;
+    if (used_pages > 0) {
+      stats->mem_used_kb = (long)((used_pages * (unsigned long long)page_size) / 1024ULL);
+    } else if (free_pages > 0) {
+      long free_kb = (long)((free_pages * (unsigned long long)page_size) / 1024ULL);
+      if (stats->mem_total_kb > free_kb) stats->mem_used_kb = stats->mem_total_kb - free_kb;
+    }
+  }
+
+  fp = popen("sysctl -n vm.swapusage", "r");
+  if (fp) {
+    char line[256];
+    if (fgets(line, sizeof(line), fp)) {
+      char *used_ptr = strstr(line, "used = ");
+      if (used_ptr) {
+        char used_raw[64] = {0};
+        if (sscanf(used_ptr + 7, "%63s", used_raw) == 1) {
+          stats->swap_used_kb = parse_size_kb(used_raw);
+        }
+      }
+    }
+    pclose(fp);
+  }
+
+  if (stats->app_memory_kb <= 0 && stats->mem_used_kb > 0) {
+    long app = stats->mem_used_kb - stats->wired_memory_kb - stats->compressed_memory_kb;
+    stats->app_memory_kb = app > 0 ? app : 0;
+  }
+}
+#else
+static void read_system_stats_linux(SystemStats *stats) {
+  FILE *fp = fopen("/proc/stat", "r");
+  if (fp) {
+    char line[512];
+    if (fgets(line, sizeof(line), fp)) {
+      unsigned long long user = 0;
+      unsigned long long nice = 0;
+      unsigned long long system = 0;
+      unsigned long long idle = 0;
+      unsigned long long iowait = 0;
+      unsigned long long irq = 0;
+      unsigned long long softirq = 0;
+      unsigned long long steal = 0;
+
+      int fields = sscanf(line, "cpu %llu %llu %llu %llu %llu %llu %llu %llu", &user, &nice,
+                          &system, &idle, &iowait, &irq, &softirq, &steal);
+      if (fields >= 4) {
+        unsigned long long total = user + nice + system + idle + iowait + irq + softirq + steal;
+
+        if (g_prev_cpu.valid) {
+          unsigned long long prev_total = g_prev_cpu.user + g_prev_cpu.nice + g_prev_cpu.system +
+                                          g_prev_cpu.idle + g_prev_cpu.iowait + g_prev_cpu.irq +
+                                          g_prev_cpu.softirq + g_prev_cpu.steal;
+          unsigned long long delta_total = total > prev_total ? total - prev_total : 0;
+
+          if (delta_total > 0) {
+            unsigned long long delta_user =
+                (user + nice) > (g_prev_cpu.user + g_prev_cpu.nice)
+                    ? (user + nice) - (g_prev_cpu.user + g_prev_cpu.nice)
+                    : 0;
+            unsigned long long delta_system =
+                system > g_prev_cpu.system ? system - g_prev_cpu.system : 0;
+            unsigned long long delta_idle =
+                (idle + iowait) > (g_prev_cpu.idle + g_prev_cpu.iowait)
+                    ? (idle + iowait) - (g_prev_cpu.idle + g_prev_cpu.iowait)
+                    : 0;
+
+            stats->cpu_user_percent = ((double)delta_user * 100.0) / (double)delta_total;
+            stats->cpu_system_percent = ((double)delta_system * 100.0) / (double)delta_total;
+            stats->cpu_idle_percent = ((double)delta_idle * 100.0) / (double)delta_total;
+          }
+        }
+
+        g_prev_cpu.user = user;
+        g_prev_cpu.nice = nice;
+        g_prev_cpu.system = system;
+        g_prev_cpu.idle = idle;
+        g_prev_cpu.iowait = iowait;
+        g_prev_cpu.irq = irq;
+        g_prev_cpu.softirq = softirq;
+        g_prev_cpu.steal = steal;
+        g_prev_cpu.valid = true;
+      }
+    }
+    fclose(fp);
+  }
+
+  long mem_total = 0;
+  long mem_available = 0;
+  long cached = 0;
+  long sreclaimable = 0;
+  long shmem = 0;
+  long active = 0;
+  long inactive = 0;
+  long swap_total = 0;
+  long swap_free = 0;
+
+  fp = fopen("/proc/meminfo", "r");
+  if (fp) {
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+      if (strncmp(line, "MemTotal:", 9) == 0) {
+        sscanf(line + 9, "%ld", &mem_total);
+      } else if (strncmp(line, "MemAvailable:", 13) == 0) {
+        sscanf(line + 13, "%ld", &mem_available);
+      } else if (strncmp(line, "Cached:", 7) == 0) {
+        sscanf(line + 7, "%ld", &cached);
+      } else if (strncmp(line, "SReclaimable:", 13) == 0) {
+        sscanf(line + 13, "%ld", &sreclaimable);
+      } else if (strncmp(line, "Shmem:", 6) == 0) {
+        sscanf(line + 6, "%ld", &shmem);
+      } else if (strncmp(line, "Active:", 7) == 0) {
+        sscanf(line + 7, "%ld", &active);
+      } else if (strncmp(line, "Inactive:", 9) == 0) {
+        sscanf(line + 9, "%ld", &inactive);
+      } else if (strncmp(line, "SwapTotal:", 10) == 0) {
+        sscanf(line + 10, "%ld", &swap_total);
+      } else if (strncmp(line, "SwapFree:", 9) == 0) {
+        sscanf(line + 9, "%ld", &swap_free);
+      }
+    }
+    fclose(fp);
+  }
+
+  if (mem_total > 0) stats->mem_total_kb = mem_total;
+  if (mem_total > 0 && mem_available > 0 && mem_total > mem_available) {
+    stats->mem_used_kb = mem_total - mem_available;
+  }
+
+  long cached_files = cached + sreclaimable - shmem;
+  stats->cached_files_kb = cached_files > 0 ? cached_files : 0;
+  stats->app_memory_kb = active + inactive;
+  stats->wired_memory_kb = 0;
+  stats->compressed_memory_kb = 0;
+
+  if (swap_total > swap_free && swap_total > 0) {
+    stats->swap_used_kb = swap_total - swap_free;
+  }
+}
+#endif
+
+static void read_system_stats(SystemStats *stats) {
+  init_system_stats(stats);
+#ifdef __APPLE__
+  read_system_stats_apple(stats);
+#else
+  read_system_stats_linux(stats);
+#endif
+
+  if (stats->mem_total_kb <= 0) stats->mem_total_kb = read_mem_total_kb();
+  if (stats->cpu_user_percent < 0) stats->cpu_user_percent = 0;
+  if (stats->cpu_system_percent < 0) stats->cpu_system_percent = 0;
+  if (stats->cpu_idle_percent < 0) stats->cpu_idle_percent = 0;
+}
+
 static char *build_process_json(size_t *out_len) {
   size_t count = 0;
   ProcessInfo *list = collect_processes(&count);
@@ -440,7 +851,8 @@ static char *build_process_json(size_t *out_len) {
 
   qsort(list, count, sizeof(ProcessInfo), compare_pid);
 
-  long mem_total_kb = read_mem_total_kb();
+  SystemStats stats;
+  read_system_stats(&stats);
 
   char current_user[64];
   current_user_name(current_user, sizeof(current_user));
@@ -449,7 +861,12 @@ static char *build_process_json(size_t *out_len) {
   sb_init(&sb, 8192);
   sb_appendf(&sb, "{\"current_user\":\"");
   sb_append_escaped(&sb, current_user);
-  sb_appendf(&sb, "\",\"count\":%zu,\"mem_total_kb\":%ld,\"processes\":[", count, mem_total_kb);
+  sb_appendf(
+      &sb,
+      "\",\"count\":%zu,\"mem_total_kb\":%ld,\"cpu_user_percent\":%.2f,\"cpu_system_percent\":%.2f,\"cpu_idle_percent\":%.2f,\"mem_used_kb\":%ld,\"app_memory_kb\":%ld,\"wired_memory_kb\":%ld,\"compressed_memory_kb\":%ld,\"cached_files_kb\":%ld,\"swap_used_kb\":%ld,\"processes\":[",
+      count, stats.mem_total_kb, stats.cpu_user_percent, stats.cpu_system_percent,
+      stats.cpu_idle_percent, stats.mem_used_kb, stats.app_memory_kb, stats.wired_memory_kb,
+      stats.compressed_memory_kb, stats.cached_files_kb, stats.swap_used_kb);
 
   for (size_t i = 0; i < count; ++i) {
     ProcessInfo *p = &list[i];
@@ -460,8 +877,9 @@ static char *build_process_json(size_t *out_len) {
     sb_append_escaped(&sb, p->user);
     sb_appendf(
         &sb,
-        "\",\"state\":\"%c\",\"threads\":%d,\"vmsize_kb\":%ld,\"vmrss_kb\":%ld,\"cpu_percent\":%.2f,\"mem_percent\":%.2f}",
-        p->state, p->threads, p->vmsize_kb, p->vmrss_kb, p->cpu_percent, p->mem_percent);
+        "\",\"state\":\"%c\",\"threads\":%d,\"cpu_time_sec\":%.2f,\"vmsize_kb\":%ld,\"vmrss_kb\":%ld,\"cpu_percent\":%.2f,\"mem_percent\":%.2f}",
+        p->state, p->threads, p->cpu_time_sec, p->vmsize_kb, p->vmrss_kb, p->cpu_percent,
+        p->mem_percent);
   }
 
   sb_appendf(&sb, "]}");
@@ -538,7 +956,8 @@ static void handle_request(int client, const char *method, const char *path, con
       const char *status = "500 Internal Server Error";
       if (errno == EPERM) status = "403 Forbidden";
       if (errno == ESRCH) status = "404 Not Found";
-      snprintf(err, sizeof(err), "{\"error\":\"kill failed\",\"errno\":%d,\"message\":\"%s\"}", errno, strerror(errno));
+      snprintf(err, sizeof(err), "{\"error\":\"kill failed\",\"errno\":%d,\"message\":\"%s\"}",
+               errno, strerror(errno));
       send_response(client, status, "application/json", err, strlen(err));
       return;
     }
@@ -553,7 +972,8 @@ static void handle_request(int client, const char *method, const char *path, con
   send_response(client, "404 Not Found", "application/json", not_found, strlen(not_found));
 }
 
-static void parse_request(const char *req, char *method, size_t mlen, char *path, size_t plen, const char **body) {
+static void parse_request(const char *req, char *method, size_t mlen, char *path, size_t plen,
+                          const char **body) {
   (void)mlen;
   (void)plen;
   method[0] = '\0';
