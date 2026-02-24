@@ -158,6 +158,8 @@ export default function App() {
   const [systemStats, setSystemStats] = useState(EMPTY_SYSTEM_STATS)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(25)
+  const [demoTaskPid, setDemoTaskPid] = useState(null)
+  const [demoTaskBusy, setDemoTaskBusy] = useState(false)
 
   const updateHistory = (list, userName, stats) => {
     const processCpu = list.reduce((sum, item) => sum + (item.cpu_percent || 0), 0)
@@ -255,6 +257,52 @@ export default function App() {
     }
   }
 
+  const startDemoTask = async () => {
+    setError('')
+    setDemoTaskBusy(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/spawn-demo-task`, {
+        method: 'POST'
+      })
+
+      const raw = await res.text()
+      let data = {}
+      if (raw) {
+        try {
+          data = JSON.parse(raw)
+        } catch {
+          throw new Error(`Unexpected response from backend (HTTP ${res.status})`)
+        }
+      }
+
+      if (!res.ok) throw new Error(data?.error || `Failed to start demo task (HTTP ${res.status})`)
+
+      const pid = Number(data?.pid || 0)
+      if (!pid) throw new Error('Backend did not return a valid PID')
+
+      setDemoTaskPid(pid)
+      setSelectedPid(pid)
+      await loadProcesses()
+    } catch (err) {
+      setError(err.message || 'Failed to start demo task')
+    } finally {
+      setDemoTaskBusy(false)
+    }
+  }
+
+  const stopDemoTask = async () => {
+    if (!demoTaskPid) return
+    const proc = processes.find((item) => item.pid === demoTaskPid)
+    if (!proc) {
+      setDemoTaskPid(null)
+      setError('Demo task is not running')
+      return
+    }
+
+    await killProcess(proc.pid, proc.name, proc.user)
+    setDemoTaskPid(null)
+  }
+
   const toggleSort = (key) => {
     if (!key) return
     if (sortKey === key) {
@@ -274,6 +322,12 @@ export default function App() {
     const id = setInterval(loadProcesses, 3000)
     return () => clearInterval(id)
   }, [autoRefresh])
+
+  useEffect(() => {
+    if (!demoTaskPid) return
+    const exists = processes.some((item) => item.pid === demoTaskPid)
+    if (!exists) setDemoTaskPid(null)
+  }, [processes, demoTaskPid])
 
   useEffect(() => {
     const nextSort = DEFAULT_SORT[activeTab] || 'cpu'
@@ -852,6 +906,22 @@ export default function App() {
             ))}
           </div>
           <div className="toolbar-right">
+            <button
+              type="button"
+              className="ghost"
+              onClick={startDemoTask}
+              disabled={demoTaskBusy}
+            >
+              {demoTaskBusy ? 'Starting...' : 'Run Demo Task'}
+            </button>
+            <button
+              type="button"
+              className="danger"
+              onClick={stopDemoTask}
+              disabled={!demoTaskPid}
+            >
+              Terminate Demo{demoTaskPid ? ` (${demoTaskPid})` : ''}
+            </button>
             <label className="switch">
               <input
                 type="checkbox"
